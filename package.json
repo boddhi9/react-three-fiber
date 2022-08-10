@@ -63,7 +63,7 @@
   },
   "homepage": "https://github.com/drcmda/react-three-fiber#readme",
   "dependencies": {
-    "@babel/runtime": "^7.7.7",
+    "@babel/runtime": "^7.18.9",
     "@juggle/resize-observer": "^3.0.2",
     "react-merge-refs": "^1.0.0",
     "react-promise-suspense": "^0.3.2",
