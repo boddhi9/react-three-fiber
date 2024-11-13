@@ -1,5 +1,4 @@
-/* eslint-disable react-hooks/rules-of-hooks */
-import { useEffect, useState, useRef, useMemo } from 'react'
+import { useEffect, useState, useRef, useMemo, useCallback } from 'react'
 import createDebounce from 'debounce'
 
 declare type ResizeObserverCallback = (entries: any[], observer: ResizeObserver) => void
@@ -35,16 +34,30 @@ type State = {
   orientationHandler: null | (() => void)
 }
 
-export type Options = {
+export interface Options {
   debounce?: number | { scroll: number; resize: number }
   scroll?: boolean
   polyfill?: { new (cb: ResizeObserverCallback): ResizeObserver }
   offsetSize?: boolean
 }
 
-export function useMeasure(
-  { debounce, scroll, polyfill, offsetSize }: Options = { debounce: 0, scroll: false, offsetSize: false },
-): Result {
+export interface EnhancedOptions extends Options {
+  throttle?: number
+  onResize?: (bounds: RectReadOnly) => void
+  onScroll?: (bounds: RectReadOnly) => void
+  observeChildren?: boolean
+}
+
+export function useEnhancedMeasure({
+  debounce,
+  scroll = false,
+  polyfill,
+  offsetSize = false,
+  throttle,
+  onResize,
+  onScroll,
+  observeChildren = false,
+}: EnhancedOptions = {}): Result {
   const ResizeObserver = polyfill || (typeof window !== 'undefined' && (window as any).ResizeObserver)
 
   const [bounds, set] = useState<RectReadOnly>({
@@ -67,7 +80,6 @@ export function useMeasure(
     return [() => {}, bounds, () => {}]
   }
 
-  // keep all state in a ref
   const state = useRef<State>({
     element: null,
     scrollContainers: null,
@@ -76,52 +88,48 @@ export function useMeasure(
     orientationHandler: null,
   })
 
-  // set actual debounce values early, so effects know if they should react accordingly
   const scrollDebounce = debounce ? (typeof debounce === 'number' ? debounce : debounce.scroll) : null
   const resizeDebounce = debounce ? (typeof debounce === 'number' ? debounce : debounce.resize) : null
 
-  // make sure to update state only as long as the component is truly mounted
   const mounted = useRef(false)
   useEffect(() => {
     mounted.current = true
     return () => void (mounted.current = false)
-  })
+  }, [])
 
-  // memoize handlers, so event-listeners know when they should update
-  const [forceRefresh, resizeChange, scrollChange] = useMemo(() => {
-    const callback = () => {
-      if (!state.current.element) return
-      const { left, top, width, height, bottom, right, x, y } =
-        state.current.element.getBoundingClientRect() as unknown as RectReadOnly
+  const updateBounds = useCallback(() => {
+    if (!state.current.element) return
+    const newBounds = state.current.element.getBoundingClientRect() as unknown as RectReadOnly
 
-      const size = {
-        left,
-        top,
-        width,
-        height,
-        bottom,
-        right,
-        x,
-        y,
-      }
-
-      if (state.current.element instanceof HTMLElement && offsetSize) {
-        size.height = state.current.element.offsetHeight
-        size.width = state.current.element.offsetWidth
-      }
-
-      Object.freeze(size)
-      if (mounted.current && !areBoundsEqual(state.current.lastBounds, size)) set((state.current.lastBounds = size))
+    const size = {
+      ...newBounds,
+      height: offsetSize && state.current.element instanceof HTMLElement ? state.current.element.offsetHeight : newBounds.height,
+      width: offsetSize && state.current.element instanceof HTMLElement ? state.current.element.offsetWidth : newBounds.width,
     }
-    return [
-      callback,
-      resizeDebounce ? createDebounce(callback, resizeDebounce) : callback,
-      scrollDebounce ? createDebounce(callback, scrollDebounce) : callback,
-    ]
-  }, [set, offsetSize, scrollDebounce, resizeDebounce])
 
-  // cleanup current scroll-listeners / observers
-  function removeListeners() {
+    Object.freeze(size)
+    if (mounted.current && !areBoundsEqual(state.current.lastBounds, size)) {
+      set((state.current.lastBounds = size))
+      onResize && onResize(size)
+    }
+  }, [set, offsetSize, onResize])
+
+  const scrollHandler = useCallback(() => {
+    updateBounds()
+    onScroll && onScroll(state.current.lastBounds)
+  }, [updateBounds, onScroll])
+
+  const [forceRefresh, resizeChange, scrollChange] = useMemo(() => {
+    const throttledUpdate = throttle ? throttleFunction(updateBounds, throttle) : updateBounds
+    const throttledScroll = throttle ? throttleFunction(scrollHandler, throttle) : scrollHandler
+    return [
+      updateBounds,
+      debounce ? createDebounce(throttledUpdate, typeof debounce === 'number' ? debounce : debounce.resize || 0) : throttledUpdate,
+      debounce ? createDebounce(throttledScroll, typeof debounce === 'number' ? debounce : debounce.scroll || 0) : throttledScroll,
+    ]
+  }, [updateBounds, scrollHandler, debounce, throttle])
+
+  const removeListeners = useCallback(() => {
     if (state.current.scrollContainers) {
       state.current.scrollContainers.forEach((element) => element.removeEventListener('scroll', scrollChange, true))
       state.current.scrollContainers = null
@@ -139,10 +147,9 @@ export function useMeasure(
         window.removeEventListener('orientationchange', state.current.orientationHandler)
       }
     }
-  }
+  }, [scrollChange])
 
-  // add scroll-listeners / observers
-  function addListeners() {
+  const addListeners = useCallback(() => {
     if (!state.current.element) return
     state.current.resizeObserver = new ResizeObserver(resizeChange)
     state.current.resizeObserver?.observe(state.current.element)
@@ -152,63 +159,69 @@ export function useMeasure(
       )
     }
 
-    // Handle orientation changes
     state.current.orientationHandler = () => {
       scrollChange()
     }
 
-    // Use screen.orientation if available
     if ('orientation' in screen && 'addEventListener' in screen.orientation) {
       screen.orientation.addEventListener('change', state.current.orientationHandler)
     } else if ('onorientationchange' in window) {
-      // Fallback to orientationchange event
       window.addEventListener('orientationchange', state.current.orientationHandler)
     }
-  }
+  }, [scroll, scrollChange, resizeChange])
 
-  // the ref we expose to the user
-  const ref = (node: HTMLOrSVGElement | null) => {
+  const ref = useCallback((node: HTMLOrSVGElement | null) => {
     if (!node || node === state.current.element) return
     removeListeners()
     state.current.element = node
     state.current.scrollContainers = findScrollContainers(node)
     addListeners()
-  }
+    
+    if (observeChildren) {
+      const childObserver = new MutationObserver(() => {
+        resizeChange()
+      })
+      childObserver.observe(node, { childList: true, subtree: true })
+      return () => childObserver.disconnect()
+    }
+  }, [removeListeners, addListeners, resizeChange, observeChildren])
 
-  // add general event listeners
-  useOnWindowScroll(scrollChange, Boolean(scroll))
-  useOnWindowResize(resizeChange)
+  useEffect(() => {
+    const onWindowScroll = () => {
+      if (scroll) {
+        scrollChange()
+      }
+    }
+    window.addEventListener('scroll', onWindowScroll, { capture: true, passive: true })
+    return () => window.removeEventListener('scroll', onWindowScroll, true)
+  }, [scroll, scrollChange])
 
-  // respond to changes that are relevant for the listeners
+  useEffect(() => {
+    window.addEventListener('resize', resizeChange)
+    return () => window.removeEventListener('resize', resizeChange)
+  }, [resizeChange])
+
   useEffect(() => {
     removeListeners()
     addListeners()
-  }, [scroll, scrollChange, resizeChange])
+  }, [scroll, scrollChange, resizeChange, removeListeners, addListeners])
 
-  // remove all listeners when the components unmounts
-  useEffect(() => removeListeners, [])
+  useEffect(() => removeListeners, [removeListeners])
+
   return [ref, bounds, forceRefresh]
 }
 
-// Adds native resize listener to window
-function useOnWindowResize(onWindowResize: (event: Event) => void) {
-  useEffect(() => {
-    const cb = onWindowResize
-    window.addEventListener('resize', cb)
-    return () => void window.removeEventListener('resize', cb)
-  }, [onWindowResize])
-}
-function useOnWindowScroll(onScroll: () => void, enabled: boolean) {
-  useEffect(() => {
-    if (enabled) {
-      const cb = onScroll
-      window.addEventListener('scroll', cb, { capture: true, passive: true })
-      return () => void window.removeEventListener('scroll', cb, true)
+function throttleFunction<T extends (...args: any[]) => void>(func: T, limit: number): T {
+  let inThrottle: boolean
+  return function(this: any, ...args: Parameters<T>): void {
+    if (!inThrottle) {
+      func.apply(this, args)
+      inThrottle = true
+      setTimeout(() => inThrottle = false, limit)
     }
-  }, [onScroll, enabled])
+  } as T
 }
 
-// Returns a list of scroll offsets
 function findScrollContainers(element: HTMLOrSVGElement | null): HTMLOrSVGElement[] {
   const result: HTMLOrSVGElement[] = []
   if (!element || element === document.body) return result
@@ -217,6 +230,5 @@ function findScrollContainers(element: HTMLOrSVGElement | null): HTMLOrSVGElemen
   return [...result, ...findScrollContainers(element.parentElement)]
 }
 
-// Checks if element boundaries are equal
 const keys: (keyof RectReadOnly)[] = ['x', 'y', 'top', 'bottom', 'left', 'right', 'width', 'height']
 const areBoundsEqual = (a: RectReadOnly, b: RectReadOnly): boolean => keys.every((key) => a[key] === b[key])
